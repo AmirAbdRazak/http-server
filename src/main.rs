@@ -57,6 +57,14 @@ impl fmt::Display for HttpVersion {
         }
     }
 }
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            HttpMethod::Get => write!(f, "GET"),
+            HttpMethod::Post => write!(f, "POST"),
+        }
+    }
+}
 impl fmt::Display for ContentType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -89,6 +97,19 @@ impl fmt::Display for Response {
             f,
             "{} {}{}{}{}{}",
             self.http_version, self.status_code, crlf, concatenated_header, crlf, self.body
+        )
+    }
+}
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let crlf = "\r\n";
+        let concatenated_header = self.headers.iter().fold(String::new(), |acc, (key, val)| {
+            format!("{acc}{key}: {val}{crlf}")
+        });
+        write!(
+            f,
+            "{} {} {}{}{}",
+            self.http_method, self.http_version, crlf, concatenated_header, crlf
         )
     }
 }
@@ -136,6 +157,21 @@ fn handle_client(request: Request) -> Response {
             body: String::from(""),
             headers: vec![],
         }
+    } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
+        let mut response = Response {
+            http_version: HttpVersion::Http1_1,
+            status_code: StatusCode::Ok,
+            body: String::from(request.headers.get("User-Agent").unwrap_or(&String::new())),
+            headers: vec![],
+        };
+
+        response.add_header("Content-Type", &ContentType::PlainText.to_string());
+        response.add_header(
+            "Content-Length",
+            &response.body.as_bytes().len().to_string(),
+        );
+
+        response
     } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
         let mut response = Response {
             http_version: HttpVersion::Http1_1,
@@ -182,7 +218,7 @@ fn parse_request(buf_reader: BufReader<&mut TcpStream>) -> Result<Request, HttpE
         .filter_map(|header_line| {
             header_line
                 .split_once(":")
-                .map(|header_vec| (header_vec.0.to_string(), header_vec.1.to_string()))
+                .map(|(key, val)| (key.trim().to_string(), val.trim().to_string()))
         })
         .collect();
 
