@@ -236,6 +236,7 @@ fn parse_request(buf_reader: BufReader<&mut TcpStream>) -> Result<Request, HttpE
         .take_while(|line| !line.is_empty())
         .collect();
 
+    println!("{:#?}", raw_request);
     let raw_status_line = &raw_request[0];
     let [raw_method, request_target, raw_version] =
         raw_status_line.split_whitespace().collect::<Vec<&str>>()[..3]
