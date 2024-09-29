@@ -1,15 +1,20 @@
 use core::fmt;
 use std::{
     collections::HashMap,
-    fs::read_to_string,
-    io::{BufRead, BufReader, Write},
+    env::args,
+    fs::{create_dir_all, read_to_string, OpenOptions},
+    io::{BufRead, BufReader, Read, Write},
+    iter::once,
     net::{TcpListener, TcpStream},
+    path::Path,
     thread::{self, JoinHandle},
 };
 
 enum StatusCode {
     Ok,
+    Created,
     NotFound,
+    ServerError,
 }
 
 enum HttpVersion {
@@ -58,6 +63,9 @@ impl Response {
     fn send_404() -> Self {
         Self::new(HttpVersion::Http1_1, StatusCode::NotFound, String::new())
     }
+    fn send_500() -> Self {
+        Self::new(HttpVersion::Http1_1, StatusCode::ServerError, String::new())
+    }
 }
 
 struct Request {
@@ -65,6 +73,7 @@ struct Request {
     request_target: String,
     http_version: HttpVersion,
     headers: HashMap<String, String>,
+    body: String,
 }
 
 impl Request {
@@ -73,12 +82,14 @@ impl Request {
         request_target: String,
         http_version: HttpVersion,
         headers: HashMap<String, String>,
+        body: String,
     ) -> Self {
         Self {
             http_method,
             request_target,
             http_version,
             headers,
+            body,
         }
     }
 }
@@ -87,7 +98,9 @@ impl fmt::Display for StatusCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Ok => write!(f, "200 OK"),
+            Self::Created => write!(f, "201 Created"),
             Self::NotFound => write!(f, "404 Not Found"),
+            Self::ServerError => write!(f, "500 Server Error"),
         }
     }
 }
@@ -137,7 +150,12 @@ impl fmt::Display for HttpException {
 impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let crlf = "\r\n";
-        let concatenated_header = self.headers.join(crlf) + crlf;
+        let concatenated_header = if self.headers.len() > 0 {
+            self.headers.join(crlf) + crlf
+        } else {
+            String::new()
+        };
+
         write!(
             f,
             "{} {}{}{}{}{}",
@@ -151,10 +169,11 @@ impl fmt::Display for Request {
         let concatenated_header = self.headers.iter().fold(String::new(), |acc, (key, val)| {
             format!("{acc}{key}: {val}{crlf}")
         });
+
         write!(
             f,
-            "{} {} {}{}{}",
-            self.http_method, self.http_version, crlf, concatenated_header, crlf
+            "{} {} {}{}{}{}",
+            self.http_method, self.http_version, crlf, concatenated_header, crlf, self.body
         )
     }
 }
@@ -188,78 +207,124 @@ impl HttpVersion {
     }
 }
 
-fn handle_request(request: Request) -> Response {
+fn handle_request(request: Request, config: Config) -> Response {
     let request_path_vec: Vec<_> = request
         .request_target
         .split("/")
         .filter(|path_section| path_section.len() > 0)
         .collect();
 
-    if request_path_vec.len() == 0 {
-        Response::send_200("")
-    } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
-        Response::send_200(request.headers.get("User-Agent").unwrap_or(&String::new()))
-    } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
-        Response::send_200(request_path_vec[1])
-    } else if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
-        let contents = read_to_string(format!(
-            "/tmp/data/codecrafters.io/http-server-tester/{}",
-            request_path_vec[1]
-        ));
+    match request.http_method {
+        HttpMethod::Get => {
+            if request_path_vec.len() == 0 {
+                Response::send_200("")
+            } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
+                Response::send_200(request.headers.get("User-Agent").unwrap_or(&String::new()))
+            } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
+                Response::send_200(request_path_vec[1])
+            } else if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
+                let contents = read_to_string(format!(
+                    "{}{}",
+                    config.directory.unwrap_or(String::new()),
+                    request_path_vec[1]
+                ));
 
-        match contents {
-            Ok(contents) => {
-                let mut response = Response::new(HttpVersion::Http1_1, StatusCode::Ok, contents);
+                match contents {
+                    Ok(contents) => {
+                        let mut response =
+                            Response::new(HttpVersion::Http1_1, StatusCode::Ok, contents);
 
-                response.add_header(
-                    "Content-Type",
-                    &ContentType::ApplicationOctetStream.to_string(),
-                );
-                response.add_header(
-                    "Content-Length",
-                    &response.body.as_bytes().len().to_string(),
-                );
+                        response.add_header(
+                            "Content-Type",
+                            &ContentType::ApplicationOctetStream.to_string(),
+                        );
+                        response.add_header(
+                            "Content-Length",
+                            &response.body.as_bytes().len().to_string(),
+                        );
 
-                response
+                        response
+                    }
+                    _err => Response::send_404(),
+                }
+            } else {
+                Response::send_404()
             }
-            _err => Response::send_404(),
         }
-    } else {
-        Response::send_404()
+        HttpMethod::Post => {
+            if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
+                let file_path = format!(
+                    "{}{}",
+                    config.clone().directory.unwrap_or(String::new()),
+                    request_path_vec[1]
+                );
+
+                if let Some(parent) = Path::new(&file_path).parent() {
+                    let _ = create_dir_all(parent);
+                }
+
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(file_path);
+
+                match file {
+                    Ok(mut file) => {
+                        let _ = file.write_all(request.body.as_bytes());
+                        let contents = read_to_string(format!(
+                            "{}{}",
+                            config.clone().directory.clone().unwrap_or(String::new()),
+                            request_path_vec[1]
+                        ));
+                        Response::new(HttpVersion::Http1_1, StatusCode::Created, String::new())
+                    }
+                    Err(_err) => Response::send_500(),
+                }
+            } else {
+                Response::send_404()
+            }
+        }
     }
 }
 
-fn parse_request(buf_reader: BufReader<&mut TcpStream>) -> Result<Request, HttpException> {
+fn parse_request(buf_reader: &mut BufReader<&mut TcpStream>) -> Result<Request, HttpException> {
     let raw_request: Vec<String> = buf_reader
         .lines()
         .map(|result| result.unwrap())
         .take_while(|line| !line.is_empty())
         .collect();
 
-    println!("{:#?}", raw_request);
-    let raw_status_line = &raw_request[0];
+    let (status_line, raw_headers) = (&raw_request[0], &raw_request[1..]);
+
     let [raw_method, request_target, raw_version] =
-        raw_status_line.split_whitespace().collect::<Vec<&str>>()[..3]
+        status_line.split_whitespace().collect::<Vec<&str>>()[..3]
     else {
-        return Err(HttpException::InvalidStatusLine(
-            raw_status_line.to_string(),
-        ));
+        return Err(HttpException::InvalidStatusLine(status_line.to_string()));
     };
 
-    let headers: HashMap<String, String> = raw_request[1..]
+    let headers: HashMap<String, String> = raw_headers
         .iter()
         .filter_map(|header_line| {
             header_line
                 .split_once(":")
-                .map(|(key, val)| (key.trim().to_string(), val.trim().to_string()))
+                .map(|(key, val)| (key.trim().to_owned(), val.trim().to_owned()))
         })
         .collect();
+
+    let content_length = headers
+        .get("Content-Length")
+        .and_then(|content_length| content_length.parse().ok())
+        .unwrap_or(0);
+    let mut body = vec![0; content_length];
+    let _ = buf_reader.read_exact(&mut body);
 
     Ok(Request::new(
         HttpMethod::parse_method(raw_method)?,
         request_target.to_string(),
         HttpVersion::parse_version(raw_version)?,
         headers,
+        String::from_utf8(body).unwrap(),
     ))
 }
 
@@ -276,7 +341,7 @@ impl ThreadPool {
         }
     }
 
-    fn execute(&mut self, stream: TcpStream) {
+    fn execute(&mut self, stream: TcpStream, config: Config) {
         self.current_connections.retain(|jh| !jh.is_finished());
 
         if self.current_connections.len() < self.max_connections {
@@ -285,32 +350,47 @@ impl ThreadPool {
                 self.current_connections.len()
             );
             self.current_connections
-                .push(thread::spawn(|| handle_connection(stream)));
+                .push(thread::spawn(|| handle_connection(stream, config)));
         } else {
             println!("=== Connection Refused ===");
         }
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
+fn handle_connection(mut stream: TcpStream, config: Config) {
+    let mut buf_reader = BufReader::new(&mut stream);
 
-    let request = parse_request(buf_reader);
+    let request = parse_request(&mut buf_reader);
     let response = match request {
-        Ok(request) => format!("{}", handle_request(request)),
+        Ok(request) => format!("{}", handle_request(request, config)),
         Err(http_exception) => format!("{}", http_exception),
     };
 
     let _ = stream.write(response.as_bytes());
 }
 
+#[derive(Clone)]
+struct Config {
+    directory: Option<String>,
+}
+
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+
+    let mut directory: Option<String> = None;
+    if args().len() > 1 {
+        if std::env::args().nth(1).expect("no pattern given") == "--directory" {
+            directory = Some(args().nth(2).expect("no pattern given"));
+        } else {
+            panic!()
+        }
+    }
+    let config = Config { directory };
 
     let mut pool = ThreadPool::new(5);
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => pool.execute(stream),
+            Ok(stream) => pool.execute(stream, config.clone()),
             Err(e) => {
                 println!("error: {}", e);
             }
