@@ -1,10 +1,9 @@
 use core::fmt;
-#[allow(unused_imports)]
-use std::net::TcpListener;
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
+    thread::{self, JoinHandle},
 };
 
 enum StatusCode {
@@ -28,9 +27,34 @@ struct Response {
 }
 
 impl Response {
+    fn new(http_version: HttpVersion, status_code: StatusCode, body: String) -> Self {
+        Self {
+            http_version,
+            status_code,
+            body,
+            headers: vec![],
+        }
+    }
+
     fn add_header(&mut self, header_name: &str, header_value: &str) {
         let header = format!("{header_name}: {header_value}");
         self.headers.push(header);
+    }
+
+    fn send_200(body: &str) -> Self {
+        let mut response = Self::new(HttpVersion::Http1_1, StatusCode::Ok, body.to_string());
+
+        response.add_header("Content-Type", &ContentType::PlainText.to_string());
+        response.add_header(
+            "Content-Length",
+            &response.body.as_bytes().len().to_string(),
+        );
+
+        response
+    }
+
+    fn send_404() -> Self {
+        Self::new(HttpVersion::Http1_1, StatusCode::NotFound, String::new())
     }
 }
 
@@ -41,11 +65,27 @@ struct Request {
     headers: HashMap<String, String>,
 }
 
+impl Request {
+    fn new(
+        http_method: HttpMethod,
+        request_target: String,
+        http_version: HttpVersion,
+        headers: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            http_method,
+            request_target,
+            http_version,
+            headers,
+        }
+    }
+}
+
 impl fmt::Display for StatusCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            StatusCode::Ok => write!(f, "200 OK"),
-            StatusCode::NotFound => write!(f, "404 Not Found"),
+            Self::Ok => write!(f, "200 OK"),
+            Self::NotFound => write!(f, "404 Not Found"),
         }
     }
 }
@@ -53,42 +93,44 @@ impl fmt::Display for StatusCode {
 impl fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            HttpVersion::Http1_1 => write!(f, "HTTP/1.1"),
+            Self::Http1_1 => write!(f, "HTTP/1.1"),
         }
     }
 }
+
 impl fmt::Display for HttpMethod {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            HttpMethod::Get => write!(f, "GET"),
-            HttpMethod::Post => write!(f, "POST"),
+            Self::Get => write!(f, "GET"),
+            Self::Post => write!(f, "POST"),
         }
     }
 }
+
 impl fmt::Display for ContentType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ContentType::PlainText => write!(f, "text/plain"),
+            Self::PlainText => write!(f, "text/plain"),
         }
     }
 }
+
 impl fmt::Display for HttpException {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            HttpException::InvalidMethod(raw_method) => {
+            Self::InvalidMethod(raw_method) => {
                 write!(f, "Invalid Method: {}", raw_method)
             }
-            HttpException::InvalidVersion(raw_version) => {
+            Self::InvalidVersion(raw_version) => {
                 write!(f, "Invalid Version: {}", raw_version)
             }
-            HttpException::InvalidStatusLine(raw_status_line) => {
+            Self::InvalidStatusLine(raw_status_line) => {
                 write!(f, "Invalid Status Line: {}", raw_status_line)
             }
         }
     }
 }
 
-// HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nabc
 impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let crlf = "\r\n";
@@ -143,7 +185,7 @@ impl HttpVersion {
     }
 }
 
-fn handle_client(request: Request) -> Response {
+fn handle_request(request: Request) -> Response {
     let request_path_vec: Vec<_> = request
         .request_target
         .split("/")
@@ -151,49 +193,13 @@ fn handle_client(request: Request) -> Response {
         .collect();
 
     if request_path_vec.len() == 0 {
-        Response {
-            http_version: HttpVersion::Http1_1,
-            status_code: StatusCode::Ok,
-            body: String::from(""),
-            headers: vec![],
-        }
+        Response::send_200("")
     } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
-        let mut response = Response {
-            http_version: HttpVersion::Http1_1,
-            status_code: StatusCode::Ok,
-            body: String::from(request.headers.get("User-Agent").unwrap_or(&String::new())),
-            headers: vec![],
-        };
-
-        response.add_header("Content-Type", &ContentType::PlainText.to_string());
-        response.add_header(
-            "Content-Length",
-            &response.body.as_bytes().len().to_string(),
-        );
-
-        response
+        Response::send_200(request.headers.get("User-Agent").unwrap_or(&String::new()))
     } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
-        let mut response = Response {
-            http_version: HttpVersion::Http1_1,
-            status_code: StatusCode::Ok,
-            body: String::from(request_path_vec[1]),
-            headers: vec![],
-        };
-
-        response.add_header("Content-Type", &ContentType::PlainText.to_string());
-        response.add_header(
-            "Content-Length",
-            &response.body.as_bytes().len().to_string(),
-        );
-
-        response
+        Response::send_200(request_path_vec[1])
     } else {
-        Response {
-            http_version: HttpVersion::Http1_1,
-            status_code: StatusCode::NotFound,
-            body: String::from(""),
-            headers: vec![],
-        }
+        Response::send_404()
     }
 }
 
@@ -222,34 +228,62 @@ fn parse_request(buf_reader: BufReader<&mut TcpStream>) -> Result<Request, HttpE
         })
         .collect();
 
-    Ok(Request {
-        http_method: HttpMethod::parse_method(raw_method)?,
-        request_target: request_target.to_string(),
-        http_version: HttpVersion::parse_version(raw_version)?,
+    Ok(Request::new(
+        HttpMethod::parse_method(raw_method)?,
+        request_target.to_string(),
+        HttpVersion::parse_version(raw_version)?,
         headers,
-    })
+    ))
 }
 
-// GET /index.html HTTP/1.1\r\nHost: localhost:4221\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n
-// HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\nabc
+struct ThreadPool {
+    max_connections: usize,
+    current_connections: Vec<JoinHandle<()>>,
+}
+
+impl ThreadPool {
+    fn new(max_connections: usize) -> Self {
+        Self {
+            max_connections,
+            current_connections: Vec::new(),
+        }
+    }
+
+    fn execute(&mut self, stream: TcpStream) {
+        self.current_connections.retain(|jh| !jh.is_finished());
+
+        if self.current_connections.len() < self.max_connections {
+            println!(
+                "=== Connection Established @ Thread {} ===",
+                self.current_connections.len()
+            );
+            self.current_connections
+                .push(thread::spawn(|| handle_connection(stream)));
+        } else {
+            println!("=== Connection Refused ===");
+        }
+    }
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let buf_reader = BufReader::new(&mut stream);
+
+    let request = parse_request(buf_reader);
+    let response = match request {
+        Ok(request) => format!("{}", handle_request(request)),
+        Err(http_exception) => format!("{}", http_exception),
+    };
+
+    let _ = stream.write(response.as_bytes());
+}
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
+    let mut pool = ThreadPool::new(5);
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                println!("=== Connection Established! ===");
-                let buf_reader = BufReader::new(&mut stream);
-
-                let request = parse_request(buf_reader);
-                let response = match request {
-                    Ok(request) => format!("{}", handle_client(request)),
-                    Err(http_exception) => format!("{}", http_exception),
-                };
-
-                let _ = stream.write(response.as_bytes());
-            }
+            Ok(stream) => pool.execute(stream),
             Err(e) => {
                 println!("error: {}", e);
             }
