@@ -1,6 +1,7 @@
 use core::fmt;
 use std::{
     collections::HashMap,
+    fs::read_to_string,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     thread::{self, JoinHandle},
@@ -16,7 +17,8 @@ enum HttpVersion {
 }
 
 enum ContentType {
-    PlainText,
+    TextPlain,
+    ApplicationOctetStream,
 }
 
 struct Response {
@@ -44,7 +46,7 @@ impl Response {
     fn send_200(body: &str) -> Self {
         let mut response = Self::new(HttpVersion::Http1_1, StatusCode::Ok, body.to_string());
 
-        response.add_header("Content-Type", &ContentType::PlainText.to_string());
+        response.add_header("Content-Type", &ContentType::TextPlain.to_string());
         response.add_header(
             "Content-Length",
             &response.body.as_bytes().len().to_string(),
@@ -110,7 +112,8 @@ impl fmt::Display for HttpMethod {
 impl fmt::Display for ContentType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Self::PlainText => write!(f, "text/plain"),
+            Self::TextPlain => write!(f, "text/plain"),
+            Self::ApplicationOctetStream => write!(f, "application/octet-stream"),
         }
     }
 }
@@ -198,6 +201,29 @@ fn handle_request(request: Request) -> Response {
         Response::send_200(request.headers.get("User-Agent").unwrap_or(&String::new()))
     } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
         Response::send_200(request_path_vec[1])
+    } else if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
+        let contents = read_to_string(format!(
+            "/tmp/data/codecrafters.io/http-server-tester/{}",
+            request_path_vec[1]
+        ));
+
+        match contents {
+            Ok(contents) => {
+                let mut response = Response::new(HttpVersion::Http1_1, StatusCode::Ok, contents);
+
+                response.add_header(
+                    "Content-Type",
+                    &ContentType::ApplicationOctetStream.to_string(),
+                );
+                response.add_header(
+                    "Content-Length",
+                    &response.body.as_bytes().len().to_string(),
+                );
+
+                response
+            }
+            _err => Response::send_404(),
+        }
     } else {
         Response::send_404()
     }
