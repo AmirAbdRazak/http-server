@@ -1,10 +1,9 @@
 use core::fmt;
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     env::args,
     fs::{create_dir_all, read_to_string, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
-    iter::once,
     net::{TcpListener, TcpStream},
     path::Path,
     thread::{self, JoinHandle},
@@ -26,6 +25,10 @@ enum ContentType {
     ApplicationOctetStream,
 }
 
+enum ContentEncoding {
+    Gzip,
+}
+
 struct Response {
     http_version: HttpVersion,
     status_code: StatusCode,
@@ -43,28 +46,34 @@ impl Response {
         }
     }
 
+    fn update(&mut self, http_version: HttpVersion, status_code: StatusCode, body: String) {
+        self.http_version = http_version;
+        self.status_code = status_code;
+        self.body = body;
+    }
+
+    fn new_404() -> Self {
+        Self::new(HttpVersion::Http1_1, StatusCode::NotFound, String::new())
+    }
+
     fn add_header(&mut self, header_name: &str, header_value: &str) {
         let header = format!("{header_name}: {header_value}");
         self.headers.push(header);
     }
 
-    fn send_200(body: &str) -> Self {
-        let mut response = Self::new(HttpVersion::Http1_1, StatusCode::Ok, body.to_string());
-
-        response.add_header("Content-Type", &ContentType::TextPlain.to_string());
-        response.add_header(
-            "Content-Length",
-            &response.body.as_bytes().len().to_string(),
-        );
-
-        response
+    fn integrate_request(&mut self, request: &Request) {
+        if let Some(content_encoding) = request.headers.get("Accept-Encoding") {
+            self.headers
+                .push(format!("Content-Encoding: {content_encoding}"))
+        }
     }
 
-    fn send_404() -> Self {
-        Self::new(HttpVersion::Http1_1, StatusCode::NotFound, String::new())
-    }
-    fn send_500() -> Self {
-        Self::new(HttpVersion::Http1_1, StatusCode::ServerError, String::new())
+    fn success(&mut self, body: &str) {
+        self.body = body.to_string();
+        self.status_code = StatusCode::Ok;
+
+        self.add_header("Content-Type", &ContentType::TextPlain.to_string());
+        self.add_header("Content-Length", &self.body.as_bytes().len().to_string());
     }
 }
 
@@ -90,6 +99,14 @@ impl Request {
             http_version,
             headers,
             body,
+        }
+    }
+
+    fn validate_headers(&mut self) {
+        if let Entry::Occupied(entry) = self.headers.entry("Accept-Encoding".to_string()) {
+            if ContentEncoding::parse_content_encoding(entry.get()).is_err() {
+                entry.remove();
+            };
         }
     }
 }
@@ -131,6 +148,14 @@ impl fmt::Display for ContentType {
     }
 }
 
+impl fmt::Display for ContentEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Gzip => write!(f, "gzip"),
+        }
+    }
+}
+
 impl fmt::Display for HttpException {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -142,6 +167,9 @@ impl fmt::Display for HttpException {
             }
             Self::InvalidStatusLine(raw_status_line) => {
                 write!(f, "Invalid Status Line: {}", raw_status_line)
+            }
+            Self::InvalidContentEncoding(raw_content_encoding) => {
+                write!(f, "Invalid Content Encoding: {}", raw_content_encoding)
             }
         }
     }
@@ -187,6 +215,7 @@ enum HttpException {
     InvalidMethod(String),
     InvalidVersion(String),
     InvalidStatusLine(String),
+    InvalidContentEncoding(String),
 }
 
 impl HttpMethod {
@@ -207,6 +236,19 @@ impl HttpVersion {
     }
 }
 
+impl ContentEncoding {
+    fn parse_content_encoding(
+        raw_content_encoding: &str,
+    ) -> Result<ContentEncoding, HttpException> {
+        match raw_content_encoding {
+            "gzip" => Ok(Self::Gzip),
+            _ => Err(HttpException::InvalidContentEncoding(
+                raw_content_encoding.to_owned(),
+            )),
+        }
+    }
+}
+
 fn handle_request(request: Request, config: Config) -> Response {
     let request_path_vec: Vec<_> = request
         .request_target
@@ -214,14 +256,15 @@ fn handle_request(request: Request, config: Config) -> Response {
         .filter(|path_section| path_section.len() > 0)
         .collect();
 
+    let mut response = Response::new_404();
     match request.http_method {
         HttpMethod::Get => {
             if request_path_vec.len() == 0 {
-                Response::send_200("")
+                response.success("");
             } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
-                Response::send_200(request.headers.get("User-Agent").unwrap_or(&String::new()))
+                response.success(request.headers.get("User-Agent").unwrap_or(&String::new()));
             } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
-                Response::send_200(request_path_vec[1])
+                response.success(request_path_vec[1]);
             } else if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
                 let contents = read_to_string(format!(
                     "{}{}",
@@ -229,27 +272,20 @@ fn handle_request(request: Request, config: Config) -> Response {
                     request_path_vec[1]
                 ));
 
-                match contents {
-                    Ok(contents) => {
-                        let mut response =
-                            Response::new(HttpVersion::Http1_1, StatusCode::Ok, contents);
+                if let Ok(contents) = contents {
+                    response.status_code = StatusCode::Ok;
+                    response.body = contents;
 
-                        response.add_header(
-                            "Content-Type",
-                            &ContentType::ApplicationOctetStream.to_string(),
-                        );
-                        response.add_header(
-                            "Content-Length",
-                            &response.body.as_bytes().len().to_string(),
-                        );
-
-                        response
-                    }
-                    _err => Response::send_404(),
-                }
-            } else {
-                Response::send_404()
-            }
+                    response.add_header(
+                        "Content-Type",
+                        &ContentType::ApplicationOctetStream.to_string(),
+                    );
+                    response.add_header(
+                        "Content-Length",
+                        &response.body.as_bytes().len().to_string(),
+                    );
+                };
+            };
         }
         HttpMethod::Post => {
             if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
@@ -272,20 +308,20 @@ fn handle_request(request: Request, config: Config) -> Response {
                 match file {
                     Ok(mut file) => {
                         let _ = file.write_all(request.body.as_bytes());
-                        let contents = read_to_string(format!(
-                            "{}{}",
-                            config.clone().directory.clone().unwrap_or(String::new()),
-                            request_path_vec[1]
-                        ));
-                        Response::new(HttpVersion::Http1_1, StatusCode::Created, String::new())
+                        response.update(HttpVersion::Http1_1, StatusCode::Created, String::new())
                     }
-                    Err(_err) => Response::send_500(),
-                }
-            } else {
-                Response::send_404()
-            }
+                    Err(_err) => response.update(
+                        HttpVersion::Http1_1,
+                        StatusCode::ServerError,
+                        String::new(),
+                    ),
+                };
+            };
         }
     }
+
+    response.integrate_request(&request);
+    response
 }
 
 fn parse_request(buf_reader: &mut BufReader<&mut TcpStream>) -> Result<Request, HttpException> {
@@ -319,13 +355,16 @@ fn parse_request(buf_reader: &mut BufReader<&mut TcpStream>) -> Result<Request, 
     let mut body = vec![0; content_length];
     let _ = buf_reader.read_exact(&mut body);
 
-    Ok(Request::new(
+    let mut request = Request::new(
         HttpMethod::parse_method(raw_method)?,
         request_target.to_string(),
         HttpVersion::parse_version(raw_version)?,
         headers,
         String::from_utf8(body).unwrap(),
-    ))
+    );
+
+    request.validate_headers();
+    Ok(request)
 }
 
 struct ThreadPool {
