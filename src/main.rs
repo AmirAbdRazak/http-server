@@ -103,8 +103,10 @@ impl Request {
     }
 
     fn validate_headers(&mut self) {
-        if let Entry::Occupied(entry) = self.headers.entry("Accept-Encoding".to_string()) {
-            if ContentEncoding::parse_content_encoding(entry.get()).is_err() {
+        if let Entry::Occupied(mut entry) = self.headers.entry("Accept-Encoding".to_string()) {
+            if let Some(valid_encoding) = ContentEncoding::parse_content_encoding(entry.get()) {
+                entry.insert(valid_encoding);
+            } else {
                 entry.remove();
             };
         }
@@ -168,9 +170,6 @@ impl fmt::Display for HttpException {
             Self::InvalidStatusLine(raw_status_line) => {
                 write!(f, "Invalid Status Line: {}", raw_status_line)
             }
-            Self::InvalidContentEncoding(raw_content_encoding) => {
-                write!(f, "Invalid Content Encoding: {}", raw_content_encoding)
-            }
         }
     }
 }
@@ -215,7 +214,6 @@ enum HttpException {
     InvalidMethod(String),
     InvalidVersion(String),
     InvalidStatusLine(String),
-    InvalidContentEncoding(String),
 }
 
 impl HttpMethod {
@@ -237,14 +235,26 @@ impl HttpVersion {
 }
 
 impl ContentEncoding {
-    fn parse_content_encoding(
-        raw_content_encoding: &str,
-    ) -> Result<ContentEncoding, HttpException> {
-        match raw_content_encoding {
-            "gzip" => Ok(Self::Gzip),
-            _ => Err(HttpException::InvalidContentEncoding(
-                raw_content_encoding.to_owned(),
-            )),
+    fn parse_content_encoding(raw_content_encoding: &str) -> Option<String> {
+        let content_encoding_list: Vec<ContentEncoding> = raw_content_encoding
+            .trim()
+            .split(",")
+            .filter_map(|encoding| match encoding.trim() {
+                "gzip" => Some(Self::Gzip),
+                _ => None,
+            })
+            .collect();
+
+        if content_encoding_list.is_empty() {
+            None
+        } else {
+            Some(
+                content_encoding_list
+                    .iter()
+                    .map(|encoding| encoding.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            )
         }
     }
 }
@@ -420,8 +430,6 @@ fn main() {
     if args().len() > 1 {
         if std::env::args().nth(1).expect("no pattern given") == "--directory" {
             directory = Some(args().nth(2).expect("no pattern given"));
-        } else {
-            panic!()
         }
     }
     let config = Config { directory };
