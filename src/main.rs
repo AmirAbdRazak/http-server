@@ -9,6 +9,8 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use flate2::{write::GzEncoder, Compression};
+
 enum StatusCode {
     Ok,
     Created,
@@ -25,6 +27,7 @@ enum ContentType {
     ApplicationOctetStream,
 }
 
+#[derive(PartialEq)]
 enum ContentEncoding {
     Gzip,
 }
@@ -32,48 +35,68 @@ enum ContentEncoding {
 struct Response {
     http_version: HttpVersion,
     status_code: StatusCode,
-    headers: Vec<String>,
-    body: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 impl Response {
-    fn new(http_version: HttpVersion, status_code: StatusCode, body: String) -> Self {
+    fn new(http_version: HttpVersion, status_code: StatusCode, body: Vec<u8>) -> Self {
         Self {
             http_version,
             status_code,
             body,
-            headers: vec![],
+            headers: HashMap::new(),
         }
     }
 
-    fn update(&mut self, http_version: HttpVersion, status_code: StatusCode, body: String) {
+    fn update(&mut self, http_version: HttpVersion, status_code: StatusCode, body: Vec<u8>) {
         self.http_version = http_version;
         self.status_code = status_code;
         self.body = body;
     }
 
     fn new_404() -> Self {
-        Self::new(HttpVersion::Http1_1, StatusCode::NotFound, String::new())
+        Self::new(HttpVersion::Http1_1, StatusCode::NotFound, vec![])
     }
 
     fn add_header(&mut self, header_name: &str, header_value: &str) {
-        let header = format!("{header_name}: {header_value}");
-        self.headers.push(header);
+        self.headers
+            .entry(header_name.to_string())
+            .and_modify(|e| *e = header_value.to_string())
+            .or_insert(header_value.to_string());
     }
 
     fn integrate_request(&mut self, request: &Request) {
         if let Some(content_encoding) = request.headers.get("Accept-Encoding") {
-            self.headers
-                .push(format!("Content-Encoding: {content_encoding}"))
+            self.compress_body(ContentEncoding::parse_content_encoding(content_encoding).unwrap());
+            self.add_header("Content-Encoding", content_encoding);
         }
     }
 
-    fn success(&mut self, body: &str) {
-        self.body = body.to_string();
+    fn compress_body(&mut self, content_encoding: Vec<ContentEncoding>) {
+        if content_encoding.contains(&ContentEncoding::Gzip) {
+            let mut encoder = GzEncoder::new(vec![], Compression::default());
+            let _ = encoder.write_all(&self.body);
+            self.body = encoder.finish().unwrap();
+            self.add_header("Content-Length", &self.body.len().to_string());
+        }
+    }
+
+    fn success(&mut self, body: Vec<u8>) {
+        self.body = body;
         self.status_code = StatusCode::Ok;
 
         self.add_header("Content-Type", &ContentType::TextPlain.to_string());
-        self.add_header("Content-Length", &self.body.as_bytes().len().to_string());
+        self.add_header("Content-Length", &self.body.len().to_string());
+    }
+
+    fn write_to_stream(&self, stream: &mut TcpStream) {
+        let crlf = "\r\n";
+
+        write!(stream, "{} {}{}", self.http_version, self.status_code, crlf).unwrap();
+        write!(stream, "{}", stringify_headers(&self.headers)).unwrap();
+        write!(stream, "{}", crlf).unwrap();
+        let _ = stream.write_all(&self.body);
     }
 }
 
@@ -105,7 +128,13 @@ impl Request {
     fn validate_headers(&mut self) {
         if let Entry::Occupied(mut entry) = self.headers.entry("Accept-Encoding".to_string()) {
             if let Some(valid_encoding) = ContentEncoding::parse_content_encoding(entry.get()) {
-                entry.insert(valid_encoding);
+                entry.insert(
+                    valid_encoding
+                        .iter()
+                        .map(|encoding| encoding.to_string())
+                        .collect::<Vec<String>>()
+                        .join(", "),
+                );
             } else {
                 entry.remove();
             };
@@ -177,16 +206,16 @@ impl fmt::Display for HttpException {
 impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let crlf = "\r\n";
-        let concatenated_header = if self.headers.len() > 0 {
-            self.headers.join(crlf) + crlf
-        } else {
-            String::new()
-        };
 
         write!(
             f,
             "{} {}{}{}{}{}",
-            self.http_version, self.status_code, crlf, concatenated_header, crlf, self.body
+            self.http_version,
+            self.status_code,
+            crlf,
+            stringify_headers(&self.headers),
+            crlf,
+            String::from_utf8(self.body.clone()).unwrap()
         )
     }
 }
@@ -235,7 +264,7 @@ impl HttpVersion {
 }
 
 impl ContentEncoding {
-    fn parse_content_encoding(raw_content_encoding: &str) -> Option<String> {
+    fn parse_content_encoding(raw_content_encoding: &str) -> Option<Vec<ContentEncoding>> {
         let content_encoding_list: Vec<ContentEncoding> = raw_content_encoding
             .trim()
             .split(",")
@@ -248,15 +277,16 @@ impl ContentEncoding {
         if content_encoding_list.is_empty() {
             None
         } else {
-            Some(
-                content_encoding_list
-                    .iter()
-                    .map(|encoding| encoding.to_string())
-                    .collect::<Vec<String>>()
-                    .join(", "),
-            )
+            Some(content_encoding_list)
         }
     }
+}
+
+fn stringify_headers(headers: &HashMap<String, String>) -> String {
+    let crlf = "\r\n";
+    headers.iter().fold(String::new(), |acc, (key, val)| {
+        format!("{acc}{key}: {val}{crlf}")
+    })
 }
 
 fn handle_request(request: Request, config: Config) -> Response {
@@ -270,11 +300,18 @@ fn handle_request(request: Request, config: Config) -> Response {
     match request.http_method {
         HttpMethod::Get => {
             if request_path_vec.len() == 0 {
-                response.success("");
+                response.success(vec![]);
             } else if request_path_vec.len() == 1 && request_path_vec[0] == "user-agent" {
-                response.success(request.headers.get("User-Agent").unwrap_or(&String::new()));
+                response.success(
+                    request
+                        .headers
+                        .get("User-Agent")
+                        .unwrap_or(&String::new())
+                        .as_bytes()
+                        .to_owned(),
+                );
             } else if request_path_vec.len() == 2 && request_path_vec[0] == "echo" {
-                response.success(request_path_vec[1]);
+                response.success(request_path_vec[1].into());
             } else if request_path_vec.len() == 2 && request_path_vec[0] == "files" {
                 let contents = read_to_string(format!(
                     "{}{}",
@@ -284,16 +321,13 @@ fn handle_request(request: Request, config: Config) -> Response {
 
                 if let Ok(contents) = contents {
                     response.status_code = StatusCode::Ok;
-                    response.body = contents;
+                    response.body = contents.into();
 
                     response.add_header(
                         "Content-Type",
                         &ContentType::ApplicationOctetStream.to_string(),
                     );
-                    response.add_header(
-                        "Content-Length",
-                        &response.body.as_bytes().len().to_string(),
-                    );
+                    response.add_header("Content-Length", &response.body.len().to_string());
                 };
             };
         }
@@ -318,13 +352,11 @@ fn handle_request(request: Request, config: Config) -> Response {
                 match file {
                     Ok(mut file) => {
                         let _ = file.write_all(request.body.as_bytes());
-                        response.update(HttpVersion::Http1_1, StatusCode::Created, String::new())
+                        response.update(HttpVersion::Http1_1, StatusCode::Created, vec![])
                     }
-                    Err(_err) => response.update(
-                        HttpVersion::Http1_1,
-                        StatusCode::ServerError,
-                        String::new(),
-                    ),
+                    Err(_err) => {
+                        response.update(HttpVersion::Http1_1, StatusCode::ServerError, vec![])
+                    }
                 };
             };
         }
@@ -410,12 +442,10 @@ fn handle_connection(mut stream: TcpStream, config: Config) {
     let mut buf_reader = BufReader::new(&mut stream);
 
     let request = parse_request(&mut buf_reader);
-    let response = match request {
-        Ok(request) => format!("{}", handle_request(request, config)),
-        Err(http_exception) => format!("{}", http_exception),
-    };
-
-    let _ = stream.write(response.as_bytes());
+    if let Ok(request) = request {
+        let response = handle_request(request, config);
+        response.write_to_stream(&mut stream);
+    }
 }
 
 #[derive(Clone)]
